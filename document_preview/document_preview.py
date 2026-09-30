@@ -2,8 +2,8 @@
 
 import email
 import functools
+import logging
 import os
-import re
 import subprocess
 import tempfile
 from base64 import b64decode, b64encode
@@ -17,7 +17,7 @@ import fitz
 import pandas
 from assemblyline.common import forge
 from assemblyline.common.exceptions import RecoverableError
-from assemblyline.odm.base import FULL_URI
+from assemblyline.odm.base import Email, URI
 from assemblyline_v4_service.common.base import ServiceBase
 from assemblyline_v4_service.common.ocr import detections as indicator_detections
 from assemblyline_v4_service.common.ocr import ocr_detections
@@ -42,7 +42,12 @@ from selenium.common.exceptions import NoAlertPresentException, WebDriverExcepti
 from selenium.webdriver import Chrome, ChromeOptions, ChromeService
 
 PDF_DPI = int(os.environ.get("PDF_DPI", 150))
+LOGGER = logging.getLogger(__name__)
 IDENTIFY = forge.get_identify(use_cache=os.environ.get("PRIVILEGED", "false").lower() == "true")
+TAG_VALIDATORS = {
+    "network.email.address": Email(),
+    "network.static.uri": URI(),
+}
 
 # Ignore default max image pixels limit imposed by Pillow
 Image.MAX_IMAGE_PIXELS = None
@@ -81,6 +86,41 @@ def _clear_caches():
     """Clear all file-level LRU caches between analysis runs."""
     _read_file_bytes.cache_clear()
     _open_fitz_doc.cache_clear()
+
+
+def _add_validated_tag(
+    section: ResultSection, tag_type: str, tag_value: str, logger: logging.Logger | None = None
+) -> bool:
+    """Validate and add a tag using Assemblyline's ODM tag validators.
+
+    Args:
+        section (ResultSection): The result section to add the validated tag to.
+        tag_type (str): The Assemblyline tag type.
+        tag_value (str): The tag value to validate.
+        logger (logging.Logger | None): Logger to use when a tag is rejected.
+
+    Returns:
+        bool: True if the tag value was valid and added, otherwise False.
+    """
+    logger = logger or LOGGER
+    try:
+        validator = TAG_VALIDATORS[tag_type]
+    except KeyError:
+        logger.warning("Rejected tag %s=%r: no Assemblyline validator is configured", tag_type, tag_value)
+        return False
+
+    try:
+        validated_value = validator.check(tag_value)
+    except (TypeError, ValueError) as err:
+        logger.warning("Rejected tag %s=%r: %s", tag_type, tag_value, err)
+        return False
+
+    if validated_value is None:
+        logger.warning("Rejected tag %s=%r: validator returned no value", tag_type, tag_value)
+        return False
+
+    section.add_tag(tag_type, validated_value)
+    return True
 
 
 # MARK: EML2HTML
@@ -439,8 +479,10 @@ class DocumentPreview(ServiceBase):
             section (ResultSection): The result section to add tags to.
             ocr_content (str): The OCR-extracted text content to scan for IOCs.
         """
-        [section.add_tag("network.email.address", node.value) for node in find_emails(ocr_content.encode())]
-        [section.add_tag("network.static.uri", node.value) for node in find_urls(ocr_content.encode())]
+        for node in find_emails(ocr_content.encode()):
+            _add_validated_tag(section, "network.email.address", node.value, self.log)
+        for node in find_urls(ocr_content.encode()):
+            _add_validated_tag(section, "network.static.uri", node.value, self.log)
 
     # MARK: QR code scanning
     def scan_for_QR_codes(self, image: Image) -> str:
@@ -543,9 +585,9 @@ class DocumentPreview(ServiceBase):
                 qr_result = self.scan_for_QR_codes(Image.open(BytesIO(_read_file_bytes(fp))))
                 if qr_result:
                     code_type, code_value = qr_result.split(":", 1)
-                    if re.match(FULL_URI, code_value):
-                        # Tag URI
-                        image_section.add_tag("network.static.uri", code_value)
+                    if _add_validated_tag(image_section, "network.static.uri", code_value, self.log):
+                        # Tagged URI
+                        pass
                     else:
                         # Write data to file
                         with NamedTemporaryFile(dir=self.working_directory, delete=False, mode="w") as fh:
@@ -599,10 +641,10 @@ class DocumentPreview(ServiceBase):
                                 continue
                             if link_uri.startswith("mailto:"):
                                 # Tag email address
-                                image_section.add_tag("network.email.address", link_uri[7:])
+                                _add_validated_tag(image_section, "network.email.address", link_uri[7:], self.log)
                             else:
                                 # Assume this is a URI
-                                image_section.add_tag("network.static.uri", link_uri)
+                                _add_validated_tag(image_section, "network.static.uri", link_uri, self.log)
 
                     if extracted_text_path is not None:
                         with open(extracted_text_path, "r") as fh:
@@ -684,9 +726,9 @@ class DocumentPreview(ServiceBase):
                     # If there are QR code detections, include it as part of the output
                     for i, detection in enumerate(qr_code_detections):
                         code_type, code_value = detection.split(":", 1)
-                        if re.match(FULL_URI, code_value):
-                            # Tag URI
-                            image_section.add_tag("network.static.uri", code_value)
+                        if _add_validated_tag(image_section, "network.static.uri", code_value, self.log):
+                            # Tagged URI
+                            pass
                         else:
                             # Write data to file
                             with NamedTemporaryFile(dir=self.working_directory, delete=False, mode="w") as fh:
