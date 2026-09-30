@@ -11,6 +11,7 @@ from hashlib import sha256
 from io import BytesIO, StringIO
 from tempfile import NamedTemporaryFile
 from time import time
+from typing import Any
 from zipfile import BadZipFile, ZipFile
 
 import fitz
@@ -89,20 +90,27 @@ def _clear_caches():
 
 
 def _add_validated_tag(
-    section: ResultSection, tag_type: str, tag_value: str, logger: logging.Logger | None = None
+    section: ResultSection, tag_type: str, tag_value: Any, logger: logging.Logger | None = None
 ) -> bool:
     """Validate and add a tag using Assemblyline's ODM tag validators.
 
     Args:
         section (ResultSection): The result section to add the validated tag to.
         tag_type (str): The Assemblyline tag type.
-        tag_value (str): The tag value to validate.
+        tag_value (Any): The tag value to validate.
         logger (logging.Logger | None): Logger to use when a tag is rejected.
 
     Returns:
         bool: True if the tag value was valid and added, otherwise False.
     """
     logger = logger or LOGGER
+    if isinstance(tag_value, bytes | bytearray | memoryview):
+        try:
+            tag_value = bytes(tag_value).decode("utf-8")
+        except UnicodeDecodeError as err:
+            logger.warning("Rejected tag %s=%r: unable to decode bytes as UTF-8: %s", tag_type, tag_value, err)
+            return False
+
     try:
         validator = TAG_VALIDATORS[tag_type]
     except KeyError:
@@ -112,7 +120,8 @@ def _add_validated_tag(
     try:
         validated_value = validator.check(tag_value)
     except (TypeError, ValueError) as err:
-        logger.warning("Rejected tag %s=%r: %s", tag_type, tag_value, err)
+        reason = str(err).replace(" not match ", " does not match ")
+        logger.warning("Rejected tag %s=%r: %s", tag_type, tag_value, reason)
         return False
 
     if validated_value is None:
